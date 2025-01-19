@@ -19,25 +19,51 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.pytest_cache/
+pytest.ini
 
 # Virtual Environment
 venv/
 ENV/
 env/
 .env
+.venv/
+pyvenv.cfg
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+.project
+.pydevproject
+.settings/
+
+# OS generated files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
 
 # Project specific
 *.log
 *.db
 .env.*
 !.env.example
+.coverage
+coverage.xml
+htmlcov/
+
+# Temporary files
+*.bak
+*.tmp
+*.temp
 
 # Railway
 .railway/
+
+# Installation files
+get-pip.py

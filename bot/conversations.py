@@ -3,20 +3,10 @@
 
 이 모듈은 텔레그램 봇의 대화 흐름을 관리합니다.
 사용자와의 상호작용을 단계별로 처리하고, 각 단계에서 적절한 응답을 제공합니다.
-
-주요 기능:
-1. 대화 상태 관리
-2. 사용자 입력 처리
-3. 키보드 메뉴 제공
-4. AI 분석 결과 전달
-
-사용자 정의:
-- 대화 흐름 수정
-- 키보드 메뉴 구성
-- 응답 메시지 형식
 """
 
-import asyncio
+import logging
+import sys
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ContextTypes,
@@ -25,493 +15,312 @@ from telegram.ext import (
     MessageHandler,
     filters
 )
-from bot.messages import ElonStyleMessageFormatter as Elon
-from services.langchain_service import LangChainService
-from database import init_db, save_analysis
+from services.imgflip_service import ImgFlipService
+import os
 
-# 데이터베이스 초기화
-init_db()
+# 로깅 설정
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.DEBUG,
+    stream=sys.stdout
+)
+logger = logging.getLogger(__name__)
 
-# AI 분석 서비스 인스턴스
-langchain_service = LangChainService()
+# ImgFlip 서비스 인스턴스
+def initialize_imgflip_service():
+    try:
+        imgflip_username = os.getenv('IMGFLIP_USERNAME')
+        imgflip_password = os.getenv('IMGFLIP_PASSWORD')
+        
+        logger.debug(f"ImgFlip 사용자 이름: {imgflip_username}")
+        logger.debug(f"ImgFlip 비밀번호가 설정되었나요? {'예' if imgflip_password else '아니오'}")
+        
+        if not imgflip_username or not imgflip_password:
+            raise ValueError("IMGFLIP_USERNAME 또는 IMGFLIP_PASSWORD가 설정되지 않았습니다.")
+        
+        imgflip_service = ImgFlipService(
+            username=imgflip_username,
+            password=imgflip_password
+        )
+        logger.info("ImgFlip 서비스 초기화 성공")
+        return imgflip_service
+    except Exception as e:
+        logger.error(f"ImgFlip 서비스 초기화 중 오류 발생: {str(e)}")
+        return None
 
-# 대화 상태 정의 - 각 상태는 하나의 질문/응답 단계를 나타냅니다
-(WAITING_START, 
- IDEA,           # 아이디어 설명 (자유 입력)
- CATEGORY,       # 서비스 분야 선택
- APPROACH,       # 접근 방식 선택
- TARGET,         # 타겟 고객 선택
- PROBLEM,        # 해결할 문제 선택
- SOLUTION,       # 해결 방안 선택
- IMPLEMENTATION, # 구현 기술 선택
- GOALS,          # 목표 선택
- NEEDS,          # 필요 사항 선택
- ANALYZING,      # AI 분석 중
- HELP_MENU) = range(12)
+imgflip_service = initialize_imgflip_service()
 
-# 키보드 메뉴 정의 - 각 단계별로 사용자에게 제공할 선택지를 구성합니다
-# 필요에 따라 옵션을 수정하거나 새로운 키보드를 추가할 수 있습니다
+# 대화 상태 정의
+(WAITING_START,
+ COIN_INPUT,      # 코인명 입력
+ EMOTION_SELECT,  # 감정 선택
+ CHARACTER_SELECT,# 캐릭터 선택
+ LANGUAGE_SELECT, # 문구 언어 선택
+ GENERATING,      # 밈 생성 중
+ HELP_MENU) = range(7)
 
-# 서비스 분야 선택 옵션
-CATEGORY_KEYBOARD = [
-    ['🚀 서비스/앱', '💡 콘텐츠/미디어'],
-    ['🤖 AI/데이터', '🎮 게임/엔터'],
-    ['🏥 건강/의료', '🎓 교육/이러닝'],
-    ['💰 금융/핀테크', '🛍️ 커머스/유통'],
-    ['✨ 직접 입력']
-]
-
-# 서비스 형태 선택 옵션
-APPROACH_KEYBOARD = [
-    ['💫 B2C 서비스', '🎯 B2B 서비스'],
-    ['🤝 B2B2C 서비스', '💡 하드웨어'],
-    ['📊 플랫폼', '🌱 콘텐츠'],
-    ['✨ 직접 입력']
-]
-
-# 타겟 고객 선택 옵션
-TARGET_KEYBOARD = [
-    ['👥 일반 소비자', '👨‍👩‍👧‍👦 가족/육아'],
-    ['👨‍💼 직장인', '🎓 학생'],
-    ['💼 소상공인', '🏢 기업'],
-    ['✨ 직접 입력']
-]
-
-# 문제 유형 선택 옵션
-PROBLEM_KEYBOARD = [
-    ['⏰ 시간/비용 절약', '📈 생산성 향상'],
-    ['😊 편의성/접근성', '🤝 소통/협업'],
-    ['💡 정보/지식 습득', '🎯 목표 달성'],
-    ['✨ 직접 입력']
-]
-
-# 해결 방식 선택 옵션
-SOLUTION_KEYBOARD = [
-    ['📱 모바일 앱', '💻 웹 서비스'],
-    ['🤖 AI 솔루션', '🎮 게임/콘텐츠'],
-    ['🛠️ 자동화 도구', '🤝 플랫폼'],
-    ['✨ 직접 입력']
-]
-
-# 구현 기술 선택 옵션
-IMPLEMENTATION_KEYBOARD = [
-    ['📱 iOS/Android', '💻 웹/크로스플랫폼'],
-    ['☁️ 클라우드/서버', '🤖 AI/ML'],
-    ['🎮 게임엔진', '🔒 블록체인'],
-    ['✨ 직접 입력']
-]
-
-# 목표 선택 옵션
-GOALS_KEYBOARD = [
-    ['📈 매출/성장', '👥 유저 확보'],
-    ['🌟 브랜드 인지도', '🤝 파트너십'],
-    ['💰 투자 유치', '🌍 해외 진출'],
-    ['✨ 직접 입력']
-]
-
-# 필요 사항 선택 옵션
-NEEDS_KEYBOARD = [
-    ['👨‍💻 개발 인력', '🎨 기획/디자인'],
-    ['💰 초기 투자금', '📊 시장 검증'],
-    ['🤝 파트너/멘토', '📢 마케팅'],
-    ['✨ 직접 입력']
-]
-
-# 도움말 메뉴 옵션
-HELP_KEYBOARD = [
-    ['📚 도움말 1'],
-    ['💡 도움말 2'],
-    ['🤝 도움말 3'],
-    ['📊 도움말 4'],
-    ['❓ 도움말 5']
-]
-
-# 시작 메뉴 옵션
+# 키보드 메뉴 정의
 START_KEYBOARD = [
-    ['✨ 시작하기'],
-    ['📚 가이드']
+    ['🎨 코인 밈 만들기'],
+    ['❓ 도움말']
 ]
+
+EMOTION_KEYBOARD = [
+    ['🚀 긍정적', '😢 부정적']
+]
+
+CHARACTER_KEYBOARD = [
+    ['🐸 페페', '🚀 일론머스크'],
+    ['👨‍💼 트럼프', '🐕 도지'],
+    ['🎮 워작']
+]
+
+LANGUAGE_KEYBOARD = [
+    ['🇰🇷 한글', '🇺🇸 영어']
+]
+
+# 캐릭터별 템플릿 ID 매핑
+CHARACTER_TEMPLATES = {
+    '🐸 페페': {
+        '긍정적': '148909805',  # 행복한 페페
+        '부정적': '114485854'   # 슬픈 페페
+    },
+    '🚀 일론머스크': {
+        '긍정적': '101470',     # 웃는 일론머스크
+        '부정적': '119139145'   # 실망한 일론머스크
+    },
+    '👨‍💼 트럼프': {
+        '긍정적': '91545132',   # 웃는 트럼프
+        '부정적': '91545132'    # 화난 트럼프
+    },
+    '🐕 도지': {
+        '긍정적': '8072285',    # 행복한 도지
+        '부정적': '247375501'   # 슬픈 도지
+    },
+    '🎮 워작': {
+        '긍정적': '61579',      # 웃는 워작
+        '부정적': '61579'       # 슬픈 워작
+    }
+}
+
+# 문구 템플릿
+PHRASES = {
+    '한글': {
+        '긍정적': [
+            '가즈아!!!',
+            '개이득',
+            '존버는 승리한다',
+            '달나라 가즈아',
+            '홀더의 승리'
+        ],
+        '부정적': [
+            '망했다',
+            '손절각',
+            '물렸다',
+            '존버 실패',
+            '거래소 멈춤'
+        ]
+    },
+    '영어': {
+        '긍정적': [
+            'LFG! 🚀',
+            'WAGMI',
+            'Bullish!',
+            'To The Moon!',
+            'Diamond Hands 💎'
+        ],
+        '부정적': [
+            'NGMI',
+            'Bearish',
+            'Panic Sell',
+            'RIP',
+            'Paper Hands 📄'
+        ]
+    }
+}
 
 async def start_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    대화 시작 핸들러
-    
-    사용자가 /start 명령어를 입력했을 때 실행됩니다.
-    웰컴 메시지와 시작 버튼을 표시합니다.
-    """
-    try:
-        # 이미지와 웰컴 메시지 전송
-        await update.message.reply_photo(
-            photo=Elon.WELCOME_IMG_URL,
-            caption=Elon.WELCOME_MESSAGE,
-            reply_markup=ReplyKeyboardMarkup(START_KEYBOARD, resize_keyboard=True)
-        )
-    except Exception as e:
-        print(f"이미지 전송 실패: {e}")
-        await update.message.reply_text(
-            Elon.WELCOME_MESSAGE,
-            reply_markup=ReplyKeyboardMarkup(START_KEYBOARD, resize_keyboard=True)
-        )
+    """시작 명령어 처리"""
+    await update.message.reply_text(
+        "안녕하세요! 🎨 코인 밈 생성 봇입니다.\n\n"
+        "코인 관련 재미있는 밈을 만들어드립니다!\n"
+        "시작하려면 '🎨 코인 밈 만들기' 버튼을 눌러주세요.",
+        reply_markup=ReplyKeyboardMarkup(START_KEYBOARD, resize_keyboard=True)
+    )
     return WAITING_START
 
 async def handle_start_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    시작 응답 처리 핸들러
-    
-    사용자가 시작 버튼을 클릭했을 때의 응답을 처리합니다.
-    분석 프로세스를 시작하거나 가이드를 제공합니다.
-    """
+    """시작 응답 처리"""
     text = update.message.text
     
-    if text == '✨ 시작하기':
-        await update.message.reply_text(Elon.QUESTIONS['idea'])
-        return IDEA
-    elif text == '📚 외부 채널 연결':
-        keyboard = [[
-            InlineKeyboardButton(
-                "✨✨✨✨✨✨✨✨✨\n✨✨연결 버튼✨✨",
-                url="http://starlenz.notion.site"
-            )
-        ]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+    if text == '🎨 코인 밈 만들기':
         await update.message.reply_text(
-            "✨✨연결 버튼✨✨",
-            reply_markup=reply_markup
+            "어떤 코인의 밈을 만들까요? 😊\n"
+            "코인의 심볼을 입력해주세요.\n\n"
+            "예시: BTC, ETH, DOGE"
         )
-        return ConversationHandler.END
+        return COIN_INPUT
+    elif text == '❓ 도움말':
+        return await help_command(update, context)
     else:
-        await update.message.reply_text("안내 메세지 👀")
+        await update.message.reply_text("메뉴에서 옵션을 선택해주세요.")
         return WAITING_START
 
-async def handle_idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    아이디어 입력 처리 핸들러
+async def handle_coin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """코인명 입력 처리"""
+    coin = update.message.text.upper()
+    context.user_data['coin'] = coin
     
-    사용자가 입력한 아이디어 설명을 저장하고
-    다음 단계(서비스 분야 선택)로 진행합니다.
-    """
-    context.user_data['idea'] = update.message.text
-    reply_markup = ReplyKeyboardMarkup(CATEGORY_KEYBOARD, resize_keyboard=True)
     await update.message.reply_text(
-        Elon.QUESTIONS['category'],
-        reply_markup=reply_markup
+        f"{coin}에 대한 감정을 선택해주세요!",
+        reply_markup=ReplyKeyboardMarkup(EMOTION_KEYBOARD, resize_keyboard=True)
     )
-    return CATEGORY
+    return EMOTION_SELECT
 
-async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    서비스 분야 선택 처리 핸들러
+async def handle_emotion_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """감정 선택 처리"""
+    emotion = '긍정적' if '긍정적' in update.message.text else '부정적'
+    context.user_data['emotion'] = emotion
     
-    사용자가 선택한 서비스 분야를 저장하고
-    다음 단계(서비스 형태 선택)로 진행합니다.
-    """
-    context.user_data['category'] = update.message.text
-    reply_markup = ReplyKeyboardMarkup(APPROACH_KEYBOARD, resize_keyboard=True)
     await update.message.reply_text(
-        Elon.QUESTIONS['approach'],
-        reply_markup=reply_markup
+        "밈에 사용할 캐릭터를 선택해주세요!",
+        reply_markup=ReplyKeyboardMarkup(CHARACTER_KEYBOARD, resize_keyboard=True)
     )
-    return APPROACH
+    return CHARACTER_SELECT
 
-async def handle_approach(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    서비스 형태 선택 처리 핸들러
+async def handle_character_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """캐릭터 선택 처리"""
+    character = update.message.text
+    context.user_data['character'] = character
     
-    사용자가 선택한 서비스 형태를 저장하고
-    다음 단계(타겟 고객 선택)로 진행합니다.
-    """
-    context.user_data['approach'] = update.message.text
-    reply_markup = ReplyKeyboardMarkup(TARGET_KEYBOARD, resize_keyboard=True)
     await update.message.reply_text(
-        Elon.QUESTIONS['target'],
-        reply_markup=reply_markup
+        "문구의 언어를 선택해주세요!",
+        reply_markup=ReplyKeyboardMarkup(LANGUAGE_KEYBOARD, resize_keyboard=True)
     )
-    return TARGET
+    return LANGUAGE_SELECT
 
-async def handle_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    타겟 고객 선택 처리 핸들러
+async def handle_language_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """언어 선택 및 밈 생성"""
+    language = '한글' if '한글' in update.message.text else '영어'
+    context.user_data['language'] = language
     
-    사용자가 선택한 타겟 고객을 저장하고
-    다음 단계(문제 유형 선택)로 진행합니다.
-    """
-    context.user_data['target'] = update.message.text
-    reply_markup = ReplyKeyboardMarkup(PROBLEM_KEYBOARD, resize_keyboard=True)
-    await update.message.reply_text(
-        Elon.QUESTIONS['problem'],
-        reply_markup=reply_markup
+    # 생성 중 메시지 전송
+    processing_message = await update.message.reply_text(
+        "🎨 밈을 생성하고 있습니다...\n"
+        "잠시만 기다려주세요!"
     )
-    return PROBLEM
-
-async def handle_problem(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    문제 유형 선택 처리 핸들러
-    
-    사용자가 선택한 문제 유형을 저장하고
-    다음 단계(해결 방식 선택)로 진행합니다.
-    """
-    context.user_data['problem'] = update.message.text
-    reply_markup = ReplyKeyboardMarkup(SOLUTION_KEYBOARD, resize_keyboard=True)
-    await update.message.reply_text(
-        Elon.QUESTIONS['solution'],
-        reply_markup=reply_markup
-    )
-    return SOLUTION
-
-async def handle_solution(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    해결 방식 선택 처리 핸들러
-    
-    사용자가 선택한 해결 방식을 저장하고
-    다음 단계(구현 기술 선택)로 진행합니다.
-    """
-    context.user_data['solution'] = update.message.text
-    reply_markup = ReplyKeyboardMarkup(IMPLEMENTATION_KEYBOARD, resize_keyboard=True)
-    await update.message.reply_text(
-        Elon.QUESTIONS['implementation'],
-        reply_markup=reply_markup
-    )
-    return IMPLEMENTATION
-
-async def handle_implementation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    구현 기술 선택 처리 핸들러
-    
-    사용자가 선택한 구현 기술을 저장하고
-    다음 단계(목표 선택)로 진행합니다.
-    """
-    context.user_data['implementation'] = update.message.text
-    reply_markup = ReplyKeyboardMarkup(GOALS_KEYBOARD, resize_keyboard=True)
-    await update.message.reply_text(
-        Elon.QUESTIONS['goals'],
-        reply_markup=reply_markup
-    )
-    return GOALS
-
-async def handle_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    목표 선택 처리 핸들러
-    
-    사용자가 선택한 목표를 저장하고
-    다음 단계(필요 사항 선택)로 진행합니다.
-    """
-    context.user_data['goals'] = update.message.text
-    reply_markup = ReplyKeyboardMarkup(NEEDS_KEYBOARD, resize_keyboard=True)
-    await update.message.reply_text(
-        Elon.QUESTIONS['needs'],
-        reply_markup=reply_markup
-    )
-    return NEEDS
-
-async def handle_needs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    필요 사항 선택 처리 핸들러
-    
-    사용자가 선택한 필요 사항을 저장하고
-    AI 분석을 시작합니다.
-    """
-    context.user_data['needs'] = update.message.text
     
     try:
-        # 분석 시작 메시지 전송
-        await update.message.reply_text(
-            Elon.ANALYSIS_START,
-            reply_markup=ReplyKeyboardRemove()
-        )
-        
-        # AI 분석 수행 및 결과 대기
-        analysis_result = await langchain_service.analyze_startup(context.user_data)
-        
-        if not analysis_result:
-            await update.message.reply_text(
-                "⚠️ 분석 중 오류가 발생했습니다. 다시 시도해주세요."
-            )
-            return ConversationHandler.END
+        if not imgflip_service:
+            raise ValueError("ImgFlip 서비스가 초기화되지 않았습니다.")
             
-        # 분석 결과 저장 (실패해도 분석은 계속 진행)
-        try:
-            save_analysis(
-                telegram_id=update.effective_user.id,
-                input_data=context.user_data,
-                result=analysis_result
-            )
-        except Exception as e:
-            print(f"데이터베이스 저장 오류: {e}")
-            await update.message.reply_text(
-                "⚠️ 분석 중 오류가 발생했습니다. 다시 시도해주세요."
-            )
-            return ConversationHandler.END
+        # 저장된 데이터 가져오기
+        coin = context.user_data['coin']
+        emotion = context.user_data['emotion']
+        character = context.user_data['character']
         
-        # 분석 결과 구조 보존
-        formatted_result = {
-            'summary': analysis_result.get('summary', ''),
-            'case_studies': analysis_result.get('case_studies', []),
-            'feasibility': analysis_result.get('feasibility', []),
-            'development_plan': analysis_result.get('development_plan', []),
-            'improvements': analysis_result.get('improvements', [])
-        }
+        # 템플릿 ID 가져오기
+        template_id = CHARACTER_TEMPLATES[character][emotion]
         
-        # 디버깅 로그
-        print("\n=== Analysis Result Structure ===")
-        for key, value in formatted_result.items():
-            print(f"\n{key}:")
-            if isinstance(value, list):
-                for item in value:
-                    print(f"  {item}")
-            else:
-                print(f"  {value}")
+        # 랜덤 문구 선택
+        import random
+        phrases = PHRASES[language][emotion]
+        text_top = f"${coin}"
+        text_bottom = random.choice(phrases)
         
-        context.user_data['analysis_result'] = formatted_result
+        logger.debug(f"밈 생성 시도: template_id={template_id}, text_top={text_top}, text_bottom={text_bottom}")
         
-        # 분석 결과 메시지 전송
-        formatted_message = Elon.format_analysis_result(formatted_result)
-        await update.message.reply_text(formatted_message)
-        
-        # 분석 완료 후 인라인 키보드 생성
-        keyboard = [
-            [
-                InlineKeyboardButton("외부 링크 연결", url="http://starlenz.notion.site")
-            ],
-            [
-                InlineKeyboardButton("공유하기", url="https://t.me/share/url?url=https://t.me/starlenz_bot&text=✨아이디어 분석 도우미✨"),
-                InlineKeyboardButton("관리자 문의", url="tg://resolve?domain=starlenz_inc")
-            ],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            "분석이 완료되었습니다!",
-            reply_markup=reply_markup
+        # 밈 생성
+        meme_url = imgflip_service.create_meme(
+            template_id,
+            text_top,
+            text_bottom
         )
         
-        return ConversationHandler.END
+        if not meme_url:
+            raise ValueError("밈 URL을 생성하지 못했습니다.")
+        
+        logger.debug(f"생성된 밈 URL: {meme_url}")
+        
+        # 결과 전송
+        await processing_message.delete()
+        await update.message.reply_photo(
+            photo=meme_url,
+            caption=f"🎨 {coin} 밈이 생성되었습니다!\n\n"
+                    f"캐릭터: {character}\n"
+                    f"감정: {'🚀 긍정적' if emotion == '긍정적' else '😢 부정적'}\n\n"
+                    f"다른 밈을 만들고 싶으시다면 '🎨 코인 밈 만들기'를 눌러주세요!",
+            reply_markup=ReplyKeyboardMarkup(START_KEYBOARD, resize_keyboard=True)
+        )
         
     except Exception as e:
-        print(f"분석 중 오류 발생: {e}")
-        await update.message.reply_text(
-            "⚠️ 시스템 오류가 발생했습니다. 다시 시도해주세요."
+        logger.error(f"밈 생성 중 오류 발생: {str(e)}")
+        await processing_message.edit_text(
+            "😅 죄송합니다. 오류가 발생했어요.\n"
+            "다시 시도해주세요!"
         )
-        return ConversationHandler.END
-
-async def handle_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    분석 결과 처리 핸들러
     
-    AI 분석 결과를 사용자에게 표시합니다.
-    분석 결과가 없는 경우 오류 메시지를 표시합니다.
-    """
-    if 'analysis_result' not in context.user_data:
-        await update.message.reply_text(
-            "❌ 분석 결과를 찾을 수 없습니다. 다시 시작해주세요."
-        )
-        return ConversationHandler.END
-    
-    await update.message.reply_text(
-        Elon.format_analysis_result(context.user_data['analysis_result'])
-    )
-    return ConversationHandler.END
+    return WAITING_START
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    도움말 명령어 핸들러
-    
-    사용자가 /help 명령어를 입력했을 때 실행됩니다.
-    도움말 메뉴를 표시합니다.
-    """
+    """도움말 명령어 처리"""
     help_text = (
-        "가이드:\n\n"
-        "/start | 새로운 분석 시작\n"
-        "/help | 도움말\n\n"
-        "@starlenz_inc | 관리자 연결"
+        "🎨 코인 밈 생성 봇 사용법:\n\n"
+        "1. '코인 밈 만들기' 버튼을 클릭하세요\n"
+        "2. 코인 심볼을 입력하세요 (예: BTC)\n"
+        "3. 감정을 선택하세요 (긍정/부정)\n"
+        "4. 캐릭터를 선택하세요\n"
+        "5. 문구 언어를 선택하세요\n\n"
+        "명령어:\n"
+        "/start - 시작하기\n"
+        "/cancel - 취소하기\n"
+        "/help - 도움말 보기"
     )
-    
-    # 기존의 HELP_KEYBOARD만 사용해서 키보드를 정의합니다.
-    reply_markup = ReplyKeyboardMarkup(HELP_KEYBOARD, resize_keyboard=True)
-    
-    # 텍스트와 기존 키보드를 함께 전송
-    await update.message.reply_text(help_text, reply_markup=reply_markup)
-    return HELP_MENU
-
-async def handle_help_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    도움말 메뉴 처리 핸들러
-    
-    도움말 메뉴에서 사용자가 선택한 옵션을 처리합니다.
-    각 옵션에 따라 적절한 응답을 제공합니다.
-    """
-    text = update.message.text
-    
-    # URL 매핑 정의
-    urls = {
-        'URL 연결 1...': 'http://starlenz.notion.site',
-        'URL 연결 2': 'http://starlenz.notion.site',
-        'URL 연결 3': 'http://starlenz.notion.site',
-        'URL 연결 4': 'http://starlenz.notion.site'
-    }
-    
-    # 창업 시뮬레이션 옵션 처리
-    if text == '🎮 창업 시뮬레이션: 시작하시겠습니까? YES!':
-        return await start_conversation(update, context)
-    
-    # URL 연결이 필요한 옵션 처리
-    if text in urls:
-        keyboard = [[InlineKeyboardButton("✨ 바로가기 ✨", url=urls[text])]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(
-            "✨✨✨✨✨✨✨✨✨\n✨✨연결 메세지✨✨",
-            reply_markup=reply_markup
-        )
-        return HELP_MENU
-    
-    # 기본 응답
-    reply_markup = ReplyKeyboardMarkup(HELP_KEYBOARD, resize_keyboard=True)
     await update.message.reply_text(
-        "메뉴를 선택해주세요. /help",
-        reply_markup=reply_markup
+        help_text,
+        reply_markup=ReplyKeyboardMarkup(START_KEYBOARD, resize_keyboard=True)
     )
-    return HELP_MENU
+    return WAITING_START
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    취소 명령어 핸들러
-    
-    사용자가 /cancel 명령어를 입력했을 때 실행됩니다.
-    현재 진행 중인 대화를 취소하고 초기 상태로 돌아갑니다.
-    """
+    """취소 명령어 처리"""
     await update.message.reply_text(
-        "🛑 분석이 취소되었습니다. 새로 시작하려면 /start 를 입력하세요.",
+        "🛑 밈 생성이 취소되었습니다. 새로 시작하려면 /start 를 입력하세요.",
         reply_markup=ReplyKeyboardRemove()
     )
     return ConversationHandler.END
 
-# 대화 핸들러 생성 - 봇의 전체 대화 흐름을 정의합니다
+# 대화 핸들러 정의
 analysis_conversation = ConversationHandler(
-    # 시작점 - 봇과의 대화를 시작할 수 있는 명령어들
     entry_points=[
         CommandHandler("start", start_conversation),
         CommandHandler("help", help_command),
         CommandHandler("cancel", cancel)
     ],
     
-    # 상태별 핸들러 - 각 상태에서 처리할 수 있는 사용자 입력 정의
     states={
-        WAITING_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_start_response)],
-        IDEA: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_idea)],
-        CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_category)],
-        APPROACH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_approach)],
-        TARGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_target)],
-        PROBLEM: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_problem)],
-        SOLUTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_solution)],
-        IMPLEMENTATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_implementation)],
-        GOALS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_goals)],
-        NEEDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_needs)],
-        ANALYZING: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_analysis)],
-        HELP_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_help_menu)]
+        WAITING_START: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_start_response)
+        ],
+        COIN_INPUT: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_coin_input)
+        ],
+        EMOTION_SELECT: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_emotion_select)
+        ],
+        CHARACTER_SELECT: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_character_select)
+        ],
+        LANGUAGE_SELECT: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_language_select)
+        ],
+        HELP_MENU: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, help_command)
+        ]
     },
     
-    # 폴백 - 어떤 상태에서든 실행할 수 있는 명령어들
     fallbacks=[
-        CommandHandler("start", start_conversation), 
+        CommandHandler("start", start_conversation),
         CommandHandler("help", help_command),
         CommandHandler("cancel", cancel)
     ]
